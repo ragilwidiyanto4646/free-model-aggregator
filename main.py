@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -51,6 +52,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 VERSION = "1.0.0"
+
+# Largest request body the server reads (10 MiB). A prompt is text; even
+# a 1M-token context window is ~4 MB of characters, so this is far above
+# any legitimate trial request. Without a cap, an unauthenticated client
+# can make the server buffer an arbitrarily large body in memory --
+# Content-Length is otherwise trusted blindly in Handler._read_json --
+# and a GB-scale body exhausts memory and kills the trial process.
+MAX_REQUEST_BYTES = 10 * 1024 * 1024
+
+
+class _RequestTooLarge(Exception):
+    """Content-Length exceeds MAX_REQUEST_BYTES; answered with 413."""
 
 # ---------------------------------------------------------------------------
 # Built-in simulated catalog (fallback when no env is reachable).
@@ -941,6 +954,41 @@ def local_provider_answer(provider, model, payload):
     return 200, {"candidates": [{"content": {"parts": parts},
                                  "finishReason": "STOP"}]}
 
+def _invalid_reason(body):
+    """Why a decoded request body cannot be routed, or None if it can.
+
+    The router assumes the shapes below; anything else used to raise
+    inside the handler (AttributeError / ValueError) and drop the
+    connection without any HTTP response. Reject it with a 400 instead.
+    """
+    if not isinstance(body, dict):
+        return "request body must be a JSON object"
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not all(
+            isinstance(m, dict) for m in messages):
+        return "messages is required and must be a list of objects"
+    max_tokens = body.get("max_tokens")
+    if max_tokens is not None:
+        try:
+            int(max_tokens)
+        except (TypeError, ValueError):
+            return "max_tokens must be a number"
+    fmt = body.get("response_format")
+    if fmt is not None and not isinstance(fmt, dict):
+        return "response_format must be an object"
+    tools = body.get("tools")
+    if tools is not None and (not isinstance(tools, list) or not all(
+            isinstance(t, dict) for t in tools)):
+        return "tools must be a list of objects"
+    system = body.get("system")
+    if system is not None and not isinstance(system, (str, list)):
+        return "system must be a string or a list of blocks"
+    if isinstance(system, list) and not all(
+            isinstance(b, dict) for b in system):
+        return "system must be a string or a list of blocks"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # HTTP server: OpenAI + Anthropic APIs, JSON and streaming
 # ---------------------------------------------------------------------------
@@ -961,14 +1009,65 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _drain_oversized_body(self, length):
+        """Discard an oversized request body, bounded in time and memory.
+
+        A 413 sent while the client is still uploading is usually lost
+        (the server closes a socket with unread data, the kernel
+        answers RST, and the client never sees the response). So drain
+        what is already arriving -- in small chunks, never buffered --
+        and stop after a short time budget, so a trickling client can
+        hold this thread for ~2s at most. Returns when the body is
+        fully drained, the client goes away, or the budget runs out.
+        """
+        deadline = time.monotonic() + 2.0
+        remaining = length
+        conn = self.connection
+        old_timeout = conn.gettimeout()
+        try:
+            while remaining > 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                conn.settimeout(min(left, 0.5))
+                try:
+                    data = self.rfile.read(min(65536, remaining))
+                except (OSError, ValueError):
+                    break
+                if not data:
+                    break
+                remaining -= len(data)
+        finally:
+            try:
+                conn.settimeout(old_timeout)
+            except OSError:
+                pass
+
     def _read_json(self):
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length < 0:
+            return None
+        if length > MAX_REQUEST_BYTES:
+            # Reject before buffering anything, but drain what the
+            # client is already sending (bounded: 64 KB chunks, ~2s)
+            # so the 413 below is actually delivered instead of being
+            # lost to a TCP reset on a half-uploaded body. A huge
+            # Content-Length with a slow or absent body would otherwise
+            # park this handler thread in rfile.read() indefinitely.
+            self._drain_oversized_body(length)
+            self.close_connection = True
+            raise _RequestTooLarge()
         raw = self.rfile.read(length) if length else b""
         if not raw:
             return {}
         try:
             return json.loads(raw.decode("utf-8"))
-        except ValueError:
+        except (ValueError, RecursionError):
+            # ValueError covers bad JSON / bad UTF-8; RecursionError
+            # covers pathologically nested JSON (json.loads recurses).
             return None
 
     def _is_anthropic_wire(self):
@@ -1005,13 +1104,24 @@ class Handler(BaseHTTPRequestHandler):
     # -- OpenAI chat completions -------------------------------------------
     def _openai_chat(self, body):
         router = self.router
-        if body is None or not isinstance(body.get("messages"), list):
+        reason = _invalid_reason(body)
+        if reason is not None:
             self._send_json(400, {"error": {
-                "message": "messages is required and must be a list",
+                "message": reason,
                 "type": "invalid_request_error", "code": "invalid_messages"}})
             return
         seq = router.next_seq()
-        result, attempts = router.route("openai", body)
+        try:
+            result, attempts = router.route("openai", body)
+        except (AttributeError, TypeError, ValueError, KeyError):
+            # A request field with a shape the router did not expect
+            # (e.g. tool_calls arguments as an object instead of a
+            # string). Answer 400; never drop the connection.
+            self._send_json(400, {"error": {
+                "message": "request fields have an invalid shape",
+                "type": "invalid_request_error",
+                "code": "invalid_request"}})
+            return
         served_model = body.get("model") or ""
         log = {"seq": seq, "wire": "openai",
                "model_requested": served_model,
@@ -1099,13 +1209,20 @@ class Handler(BaseHTTPRequestHandler):
     # -- Anthropic messages --------------------------------------------------
     def _anthropic_messages(self, body):
         router = self.router
-        if body is None or not isinstance(body.get("messages"), list):
+        reason = _invalid_reason(body)
+        if reason is not None:
             self._send_json(400, {"error": {
                 "type": "invalid_request_error",
-                "message": "messages is required and must be a list"}})
+                "message": reason}})
             return
         seq = router.next_seq()
-        result, attempts = router.route("anthropic", body)
+        try:
+            result, attempts = router.route("anthropic", body)
+        except (AttributeError, TypeError, ValueError, KeyError):
+            self._send_json(400, {"error": {
+                "type": "invalid_request_error",
+                "message": "request fields have an invalid shape"}})
+            return
         log = {"seq": seq, "wire": "anthropic",
                "model_requested": body.get("model") or "",
                "model_served": result.get("model", ""),
@@ -1233,7 +1350,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         if path == "/v1/chat/completions":
-            body = self._read_json()
+            try:
+                body = self._read_json()
+            except _RequestTooLarge:
+                self._send_json(413, {"error": {
+                    "message": "request body exceeds %d bytes"
+                               % MAX_REQUEST_BYTES,
+                    "type": "invalid_request_error",
+                    "code": "request_too_large"}})
+                return
             if body is None:
                 self._send_json(400, {"error": {
                     "message": "invalid JSON",
@@ -1241,7 +1366,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._openai_chat(body)
         elif path == "/v1/messages":
-            body = self._read_json()
+            try:
+                body = self._read_json()
+            except _RequestTooLarge:
+                self._send_json(413, {"error": {
+                    "type": "invalid_request_error",
+                    "message": "request body exceeds %d bytes"
+                               % MAX_REQUEST_BYTES}})
+                return
             if body is None:
                 self._send_json(400, {"error": {
                     "type": "invalid_request_error",
@@ -1249,7 +1381,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._anthropic_messages(body)
         elif path == "/v1/messages/count_tokens":
-            body = self._read_json() or {}
+            try:
+                body = self._read_json() or {}
+            except _RequestTooLarge:
+                self._send_json(413, {"error": {
+                    "type": "invalid_request_error",
+                    "message": "request body exceeds %d bytes"
+                               % MAX_REQUEST_BYTES}})
+                return
             tokens = estimate_tokens(text_of_messages(
                 body.get("messages"))) + (
                     estimate_tokens(body.get("system") or "")

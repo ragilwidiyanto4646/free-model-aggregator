@@ -68,6 +68,11 @@ installed before the server runs, per the bounty rules).
   are sequence-based (`chatcmpl-0001`, `msg-0001`, …), token counts
   are `ceil(chars/4)`. The state export (`state.json`) is sorted-key
   JSON with a catalog SHA-256.
+- **Input limits.** A request body larger than 10 MiB is rejected
+  with `413` before a byte is buffered (an unauthenticated client
+  must not be able to exhaust the server's memory with one request),
+  and a malformed request (bad JSON, wrong field shapes) gets a `400`
+  instead of a dropped connection.
 - **Exit.** When the env's `GET /work` says done **and** this server
   has served its 20 requests, it writes the state export and exits 0.
   (`MAKEFUN_NO_AUTO_EXIT=1` disables the auto-exit; an escape hatch
