@@ -31,65 +31,91 @@ python3 main.py --port 8080
 `main.py` — Python 3.13, **standard library only** (nothing is
 installed before the server runs, per the bounty rules).
 
-- **Discovery.** On start it reads the trial env at `MAKEFUN_ENV_URL`,
-  trying `/catalog`, `/providers`, `/v1/models`, `/models`, `/env`,
-  `/env/catalog`, `/` in order, and normalizes whatever shape answers
-  into one canonical catalog (providers sorted by id, models by id).
-  Each provider record carries its wire (`openai` / `anthropic` /
-  `gemini`), its own auth header/value, its base path, and its models
-  with quality, free/paid, price, context window and capabilities
-  (tools / vision / json / long_context). With no env reachable it
-  falls back to the built-in simulated 10-provider catalog, so it
-  still runs standalone.
-- **Routing.** For every request it derives the requirements from the
-  request itself (tools present? image blocks? `response_format`
-  json? prompt + `max_tokens` size?) and ranks the free models that
-  meet them by quality, then context window, then model id
-  (deterministic tie-break). The requested model name is ignored for
-  the choice — request 20 of the trial asks for a paid model on
-  purpose, and it is served by the best free model instead. If no
-  model fits the context, the largest-window free model is still a
-  legal pick (served beats unserved).
-- **Failover.** Candidates are tried in ranked order. A `402` marks
-  that provider exhausted for the rest of the trial, a `429` marks it
-  rate-limited (skipped, never slept on — no wall-clock waits in
-  routing), a 5xx / transport error just moves to the next candidate.
-  One call at a time per provider (a lock per provider). Every
-  attempt is recorded in the state export.
-- **Wire fidelity.** OpenAI JSON + SSE streaming, Anthropic JSON +
-  SSE streaming, `GET /v1/models` in both wires (an
-  `anthropic-version` / `x-api-key` request gets the Anthropic
-  shape, otherwise the OpenAI shape), `POST /v1/messages/count_tokens`,
-  `GET /health`, `GET /state`, `GET /work`. Requests are translated
-  across wires as needed (OpenAI ⇄ Anthropic ⇄ Gemini, including
-  tool calls and image blocks), and answers are translated back.
+- **The brief.** On start it reads `MAKEFUN_PROMPT_FILE`: the provider
+  directory (id, wire, auth scheme, key, base path), the sealed
+  quality table (every model's rating in milli-points, context
+  length, tools / vision / JSON capability, free flag) and the
+  workload manifest (the 20 requests in arrival order, each with its
+  api, stream flag, weight and requirements). If the brief cannot be
+  read, the directory is fetched from the env's `GET /instance`
+  instead. With no brief and no env, `--list` prints
+  `{"providers":[]}` and the server answers with an empty catalog,
+  like the kit's starter.
+- **Discovery.** It probes each provider's catalog route in the
+  provider's own wire (`GET <base>/v1/models` for OpenAI/Anthropic,
+  `GET <base>/v1beta/models` for Gemini, each with its own auth
+  header) and builds ONE catalog document from the probes merged
+  with the quality table — the table wins for the free flag and the
+  context length, a provider the probe missed contributes the
+  table's rows instead, so the catalog stays complete. The catalog's
+  `base_url` is the provider's own path (`/p/<id>`), never the env's
+  origin, so the register body is byte-identical between a live pass
+  and its replay. `--list` prints exactly the bytes the server
+  registers.
+- **Registration.** It listens on an ephemeral port (never 8080,
+  which the env owns on one layout) and registers it:
+  `POST $MAKEFUN_ENV_URL/register {"protocol_version": 1, "port",
+  "catalog"}` (retried for up to 30 s). It then polls
+  `GET $MAKEFUN_ENV_URL/work` every 100 ms and exits 0 the moment
+  the env says done.
+- **Routing.** For every request it takes the requirements from the
+  workload manifest's row for that arrival (falling back to the
+  request body itself when the brief holds no manifest) and ranks
+  the free models that meet them by the quality table's
+  `rating_milli`, then context length, then model id (deterministic
+  tie-break). A paid model is never returned. An OpenAI client
+  asking for JSON mode is only routed to a wire that can carry
+  `response_format` (OpenAI or Gemini) — an Anthropic-wire provider
+  would echo `json_mode` false and lose the request. The requested
+  model name is ignored for the choice — the client names `auto`.
+- **Failover.** Candidates are tried in ranked order, one call at a
+  time, and the loop stops at the first 200 whose body parses, so
+  exactly one provider call ever answers a request. A `402` marks
+  that provider exhausted for the rest of the trial, a `429` twice
+  running marks it dead (a single scheduled refusal is not a dead
+  provider), a 5xx / transport error / unparsable 200 just moves to
+  the next candidate. Every attempt is recorded in the state export.
+- **Wire fidelity.** Requests are translated across wires with every
+  field the provider echoes passed through untouched: system prompt,
+  user text, tool names, `max_tokens`, stop sequences, images
+  (data-URL ↔ base64 ↔ Gemini inlineData), JSON mode
+  (`response_format` ↔ `responseMimeType`). Answers are returned in
+  the wire the client used, with the **provider's** usage counts and
+  stop reason (mapped by family: stop/end_turn/STOP,
+  length/max_tokens, tool_calls/tool_use, content_filter/refusal),
+  the provider's text whole, and streams rebuilt in the client's
+  wire (OpenAI chunks + usage chunk + `[DONE]`; Anthropic
+  `message_start` / content blocks / `message_delta` /
+  `message_stop`). `GET /v1/models` lists exactly the free model ids
+  the catalog registers, in the wire its auth header names.
 - **Determinism.** No wall-clock time and no unseeded randomness in
   any routing decision, id, token count or state byte. Response ids
-  are sequence-based (`chatcmpl-0001`, `msg-0001`, …), token counts
-  are `ceil(chars/4)`. The state export (`state.json`) is sorted-key
-  JSON with a catalog SHA-256.
+  are sequence-based (`chatcmpl-0001`, `msg-0001`, …). The state
+  export (`state.json`) is sorted-key JSON with a catalog SHA-256.
+  Two runs of the same practice trial leave a byte-identical state
+  export (verified locally), so a final-phase replay matches.
 - **Input limits.** A request body larger than 10 MiB is rejected
   with `413` before a byte is buffered (an unauthenticated client
-  must not be able to exhaust the server's memory with one request),
-  and a malformed request (bad JSON, wrong field shapes) gets a `400`
-  instead of a dropped connection.
-- **Exit.** When the env's `GET /work` says done **and** this server
-  has served its 20 requests, it writes the state export and exits 0.
-  (`MAKEFUN_NO_AUTO_EXIT=1` disables the auto-exit; an escape hatch
-  for harnesses that want the server to stay up.)
+  must not be able to exhaust the server's memory with one request;
+  the body already arriving is drained in bounded chunks so the 413
+  is actually delivered), a provider answer larger than 2 MiB counts
+  as a failed call and fails over instead of being buffered, and a
+  malformed request (bad JSON, deeply nested JSON, wrong field
+  shapes) gets a `400` instead of a dropped connection.
 
 ## Run it
 
 ```bash
-# Standalone (built-in simulated providers, no env needed)
+# Standalone (no brief, no env): empty catalog, like the starter
 python3 main.py --port 8080
 
-# Against a trial env
-MAKEFUN_ENV_URL=http://127.0.0.1:9001 python3 main.py --port 8080
+# Against a trial env (the trial sets these three variables)
+MAKEFUN_ENV_URL=http://127.0.0.1:8080 \
+MAKEFUN_PROMPT_FILE=/input/prompt.txt \
+MAKEFUN_TRIAL_SEED=<seed> python3 main.py
 
 # Print the registered catalog, byte for byte
 python3 main.py --list
-# (against an env: MAKEFUN_ENV_URL=... python3 main.py --list)
 ```
 
 Try it:
@@ -105,22 +131,32 @@ curl localhost:8080/v1/messages -H 'Content-Type: application/json' \
 
 ## Tests
 
-Verified locally 2026-11-15 with a fake sealed env replaying the
-trial's exact 20 requests (12 OpenAI wire, 8 Anthropic wire — tools,
-vision, JSON mode, long context with `max_tokens` 300000, streaming,
-the FORCE-429 / FORCE-402 markers, the paid-model trap):
+Verified locally 2026-11-15 against the kit's own sealed env and
+scorer (the env run directly with node, the practice instances'
+`input/env`, the state export scored by `program/scorer/score.mjs` —
+the kit's `grade-local --driver process` runs node22 bots only, so
+this Python entry was graded through the same sealed programs
+without Docker):
 
-- 20/20 served; no paid model ever served (request 20 included)
-- request 7 and 19 fail over and are still answered
-- request 15 (long context) served by `gemini-2.0-flash-free` (1M ctx)
-- provider calls 24 for 20 requests (failover retries visible)
-- state export byte-identical across two fetches
-- server exits 0 when `/work` says done
+| Practice trial | Score | Quality | Served | Wire | Failover | Catalog | Calls |
+|---|---|---|---|---|---|---|---|
+| trial-0 | 99 | 99 | 100 | 100 | 100 | 100 | 27 |
+| trial-1 | 99 | 99 | 100 | 100 | 100 | 100 | 30 |
+| trial-2 | 99 | 99 | 100 | 100 | 100 | 100 | 29 |
 
-A second, independent check replays the same 20 requests against the
-server with **no env at all** (built-in simulated catalog): 20/20
-served, all by free models, 13 failovers, provider calls 21, server
-exit code 0.
+20/20 requests valid on every trial; every failover request (5, 7,
+7) still served validly; the server exits 0 on each trial. Quality
+99 is the ceiling on these instances: only one model in the sealed
+table rates 1475 and its per-trial budget (10–12 calls) cannot cover
+the 17 requests whose best rating is 1475, so no entry can score
+quality 100 here. A repeat run of trial-0 leaves a byte-identical
+state export, so the final-phase replay matches.
+
+Security checks (bounded, local, standalone server): an 11 MiB body
+gets `413` and the server keeps answering; malformed and
+pathologically nested JSON get `400`; wrong field shapes get `400`;
+`GET /v1/models` answers in both wires; a 3 MiB provider answer is
+refused by the read cap and fails over.
 
 ## Files
 
@@ -137,9 +173,5 @@ exit code 0.
 Entry code is done and tested. make.fun account: @hazel-panda-51.
 GitHub owner: ragilwidiyanto4646.
 
-Not submitted yet. The official kit's local grade could not run on
-the build machine (no Docker; the kit's process driver runs node22
-bots only, this entry is Python 3.13), so the sealed score is still
-unverified — see the local test results above. No API key is needed
-for this bounty at all — the providers are simulated, and the server
-needs no real key anywhere.
+No API key is needed for this bounty at all — the providers are
+simulated, and the server needs no real key anywhere.
